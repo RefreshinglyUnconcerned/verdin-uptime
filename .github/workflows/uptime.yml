@@ -1,0 +1,78 @@
+# Production uptime check for verdinmapper.com.
+# State = the result of the previous run: a failed run means "down".
+# Email goes out only when the state changes, plus a reminder every 6 hours while down.
+name: Uptime
+
+on:
+  schedule:
+    - cron: "7-59/10 * * * *" # every 10 minutes, off the busy top of the hour
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL to check. Empty = production. A bad URL tests the alarm."
+        required: false
+        default: ""
+
+permissions:
+  actions: read # read the result of the previous run, nothing else
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check production and alert on change
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESEND_KEY: ${{ secrets.RESEND_FACTORY_KEY }}
+          MAIL_TO: ${{ secrets.FACTORY_MAIL_TO }}
+          INPUT_URL: ${{ inputs.url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -u
+          URL="${INPUT_URL:-https://verdinmapper.com/}"
+          MARKER="Verdin"
+
+          # 1. Probe: 3 tries, 20 s timeout each. Up = HTTP 2xx/3xx and the marker on the page.
+          up=0; detail=""
+          for i in 1 2 3; do
+            code=$(curl -sS -L --max-time 20 -o body.html -w '%{http_code}' "$URL" 2>err.txt || true)
+            if [[ "$code" =~ ^[23] ]] && grep -q "$MARKER" body.html; then up=1; break; fi
+            detail="HTTP ${code:-none}; $(head -c 200 err.txt)"
+            [ "$i" -lt 3 ] && sleep 15
+          done
+
+          # 2. Previous state: newest completed run that succeeded or failed.
+          prev=$(gh run list -R "$GITHUB_REPOSITORY" --workflow uptime.yml --status completed --limit 20 \
+            --json conclusion -q '[.[] | select(.conclusion=="success" or .conclusion=="failure")][0].conclusion // "success"')
+
+          send() {
+            if [ -z "$RESEND_KEY" ] || [ -z "$MAIL_TO" ]; then echo "::error::mail secrets are not set"; return; fi
+            body=$(jq -n --arg to "$MAIL_TO" --arg s "$1" --arg t "$2" \
+              '{from:"Verdin uptime <uptime@mail.verdinmapper.com>", to:[$to], subject:$s, text:$t}')
+            status=$(curl -sS -o resp.json -w '%{http_code}' -X POST https://api.resend.com/emails \
+              -H "Authorization: Bearer $RESEND_KEY" -H "Content-Type: application/json" -d "$body" || true)
+            if [[ "$status" =~ ^2 ]]; then echo "mail sent: $1"; else echo "::error::Resend HTTP $status: $(head -c 300 resp.json)"; fi
+          }
+
+          now=$(date -u '+%Y-%m-%d %H:%M UTC')
+          if [ "$up" -eq 1 ]; then
+            echo "UP: $URL (previous: $prev)"
+            if [ "$prev" = "failure" ]; then
+              send "Verdin RECOVERED: $URL" "$URL answers again at $now. Run: $RUN_URL"
+            fi
+            exit 0
+          fi
+
+          echo "DOWN: $URL - $detail (previous: $prev)"
+          hour=$((10#$(date -u +%H))); minute=$((10#$(date -u +%M)))
+          if [ "$prev" != "failure" ]; then
+            send "Verdin DOWN: $URL" "$URL failed 3 checks at $now. Last result: $detail. Run: $RUN_URL"
+          elif [ $((hour % 6)) -eq 0 ] && [ "$minute" -lt 10 ]; then
+            send "Verdin STILL DOWN: $URL" "$URL is still down at $now. Last result: $detail. Run: $RUN_URL"
+          fi
+          exit 1
